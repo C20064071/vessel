@@ -98,8 +98,8 @@ def interpolate_pos_embed(model, checkpoint_model):
 
 
 
-class vessel_MAE_new(nn.Module):
-    def __init__(self, img_size=(48,512), patch_size=(16,32), in_chans=1,
+class vessel_MIM(nn.Module):
+    def __init__(self, img_size=(48,512), patch_size=(16,32), mask_ratio=0.75, in_chans=1,
                  embed_dim=512, depth=4, num_heads=8,
                  decoder_embed_dim=256, decoder_depth=2, decoder_num_heads=8,
                  mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False):
@@ -109,6 +109,7 @@ class vessel_MAE_new(nn.Module):
         # MAE encoder specifics
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
         num_patches = self.patch_embed.num_patches
+        self.mask_ratio = mask_ratio
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim), requires_grad=False)  # fixed sin-cos embedding
@@ -150,10 +151,14 @@ class vessel_MAE_new(nn.Module):
     def initialize_weights(self):
         # initialization
         # initialize (and freeze) pos_embed by sin-cos embedding
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], 3,16, cls_token=True)
+        imgh = self.patch_embed.img_size[0]
+        imgw = self.patch_embed.img_size[1]
+        ph = self.patch_embed.patch_size[0]
+        pw = self.patch_embed.patch_size[1]
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], imgh//ph, imgw//pw, cls_token=True)
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
-        decoder_pos_embed = get_2d_sincos_pos_embed(self.decoder_pos_embed.shape[-1],3,16, cls_token=True)
+        decoder_pos_embed = get_2d_sincos_pos_embed(self.decoder_pos_embed.shape[-1],imgh//ph,imgw//pw, cls_token=True)
         self.decoder_pos_embed.data.copy_(torch.from_numpy(decoder_pos_embed).float().unsqueeze(0))
 
         # initialize patch_embed like nn.Linear (instead of nn.Conv2d)
@@ -200,10 +205,12 @@ class vessel_MAE_new(nn.Module):
         """
         ph = self.patch_embed.patch_size[0]
         pw = self.patch_embed.patch_size[1]
+        imgh = self.patch_embed.img_size[0]
+        imgw = self.patch_embed.img_size[1]
 
         #ここの数は注意が必要
-        h = 3
-        w = 16
+        h = imgh/ph
+        w = imgw/pw
         # assert h * w == x.shape[1]
         
         x = x.reshape(shape=(x.shape[0], h, w, ph, pw, 1))
@@ -283,9 +290,6 @@ class vessel_MAE_new(nn.Module):
         # add pos embed
         x = x + self.decoder_pos_embed
 
-        # add pos embed
-        # x = x + self.decoder_pos_embed
-
         # apply Transformer blocks
         for blk in self.decoder_blocks:
             x = blk(x)
@@ -311,10 +315,10 @@ class vessel_MAE_new(nn.Module):
             mean = target.mean(dim=-1, keepdim=True)
             var = target.var(dim=-1, keepdim=True)
             target = (target - mean) / (var + 1.e-6)**.5
-
+     
         loss = (pred - target) ** 2
         loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
-        tmp=loss * mask
+        # tmp=loss * mask
         loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
 
         return loss
@@ -330,9 +334,9 @@ class vessel_MAE_new(nn.Module):
 
         return loss
 
-    def forward(self, imgs, fom, mask_ratio=0.75):
+    def forward(self, imgs, fom):
         latent, feature = self.forward_encoder(imgs)
-        pred, mask, ids_restore = self.forward_decoder(latent, mask_ratio)  # [N, L, p*p*3]
+        pred, mask, ids_restore = self.forward_decoder(latent, self.mask_ratio)  # [N, L, p*p*3]
         mae_loss = self.forward_mae_loss(imgs, pred, mask)
         fom_loss = self.forward_fom_loss(feature,fom)
         return fom_loss, mae_loss

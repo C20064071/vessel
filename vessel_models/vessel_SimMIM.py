@@ -1,402 +1,344 @@
-from functools import partial
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from timm.models.layers import trunc_normal_
+
+from timm.models.vision_transformer import PatchEmbed, Block
+
+# from util.pos_embed import get_2d_sincos_pos_embed
 
 
-import math
-from functools import partial
+import numpy as np
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
-# from .swin_transformer import SwinTransformer
-# from .vision_transformer import VisionTransformer
-
-
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        # x = self.drop(x)
-        # comment out this for the orignal BERT implement
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
-
-
-class Attention(nn.Module):
-    def __init__(
-            self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0.,
-            proj_drop=0., window_size=None, attn_head_dim=None):
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        if attn_head_dim is not None:
-            head_dim = attn_head_dim
-        all_head_dim = head_dim * self.num_heads
-        self.scale = qk_scale or head_dim ** -0.5
-
-        self.qkv = nn.Linear(dim, all_head_dim * 3, bias=False)
-        if qkv_bias:
-            self.q_bias = nn.Parameter(torch.zeros(all_head_dim))
-            self.v_bias = nn.Parameter(torch.zeros(all_head_dim))
-        else:
-            self.q_bias = None
-            self.v_bias = None
-
-        if window_size:
-            self.window_size = window_size
-            # cls to token & token to cls & cls to cls
-            self.num_relative_distance = (2 * window_size[0] - 1) * (2 * window_size[1] - 1) + 3
-            self.relative_position_bias_table = nn.Parameter(
-                torch.zeros(self.num_relative_distance, num_heads))  # 2*Wh-1 * 2*Ww-1, nH
-
-            # get pair-wise relative position index for each token inside the window
-            coords_h = torch.arange(window_size[0])
-            coords_w = torch.arange(window_size[1])
-            coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
-            coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
-            relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
-            relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
-            relative_coords[:, :, 0] += window_size[0] - 1  # shift to start from 0
-            relative_coords[:, :, 1] += window_size[1] - 1
-            relative_coords[:, :, 0] *= 2 * window_size[1] - 1
-            relative_position_index = \
-                torch.zeros(size=(window_size[0] * window_size[1] + 1, ) * 2, dtype=relative_coords.dtype)
-            relative_position_index[1:, 1:] = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
-            relative_position_index[0, 0:] = self.num_relative_distance - 3
-            relative_position_index[0:, 0] = self.num_relative_distance - 2
-            relative_position_index[0, 0] = self.num_relative_distance - 1
-
-            self.register_buffer("relative_position_index", relative_position_index)
-        else:
-            self.window_size = None
-            self.relative_position_bias_table = None
-            self.relative_position_index = None
-
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(all_head_dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x, rel_pos_bias=None):
-        B, N, C = x.shape
-        qkv_bias = None
-        if self.q_bias is not None:
-            qkv_bias = torch.cat((self.q_bias, torch.zeros_like(self.v_bias, requires_grad=False), self.v_bias))
-        qkv = F.linear(input=x, weight=self.qkv.weight, bias=qkv_bias)
-        qkv = qkv.reshape(B, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
-
-        q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
-
-        if self.relative_position_bias_table is not None:
-            relative_position_bias = \
-                self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-                    self.window_size[0] * self.window_size[1] + 1,
-                    self.window_size[0] * self.window_size[1] + 1, -1)  # Wh*Ww,Wh*Ww,nH
-            relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
-            attn = attn + relative_position_bias.unsqueeze(0)
-
-        if rel_pos_bias is not None:
-            attn = attn + rel_pos_bias
-
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, -1)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-
-class Block(nn.Module):
-
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., init_values=None, act_layer=nn.GELU, norm_layer=nn.LayerNorm,
-                 window_size=None, attn_head_dim=None):
-        super().__init__()
-        self.norm1 = norm_layer(dim)
-        self.attn = Attention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
-            attn_drop=attn_drop, proj_drop=drop, window_size=window_size, attn_head_dim=attn_head_dim)
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-
-        if init_values is not None:
-            self.gamma_1 = nn.Parameter(init_values * torch.ones((dim)),requires_grad=True)
-            self.gamma_2 = nn.Parameter(init_values * torch.ones((dim)),requires_grad=True)
-        else:
-            self.gamma_1, self.gamma_2 = None, None
-
-    def forward(self, x, rel_pos_bias=None):
-        if self.gamma_1 is None:
-            x = x + self.drop_path(self.attn(self.norm1(x), rel_pos_bias=rel_pos_bias))
-            x = x + self.drop_path(self.mlp(self.norm2(x)))
-        else:
-            x = x + self.drop_path(self.gamma_1 * self.attn(self.norm1(x), rel_pos_bias=rel_pos_bias))
-            x = x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
-        return x
-
-
-class PatchEmbed(nn.Module):
-    """ Image to Patch Embedding
+# --------------------------------------------------------
+# 2D sine-cosine position embedding
+# References:
+# Transformer: https://github.com/tensorflow/models/blob/master/official/nlp/transformer/model_utils.py
+# MoCo v3: https://github.com/facebookresearch/moco-v3
+# --------------------------------------------------------
+def get_2d_sincos_pos_embed(embed_dim, grid_size_h=3,grid_size_w=16, cls_token=False):
     """
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
-        super().__init__()
-        img_size = to_2tuple(img_size)
-        patch_size = to_2tuple(patch_size)
-        num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
-        self.patch_shape = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.num_patches = num_patches
-
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
-
-    def forward(self, x, **kwargs):
-        B, C, H, W = x.shape
-        # FIXME look at relaxing size constraints
-        assert H == self.img_size[0] and W == self.img_size[1], \
-            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        x = self.proj(x).flatten(2).transpose(1, 2)
-        return x
-
-
-class RelativePositionBias(nn.Module):
-
-    def __init__(self, window_size, num_heads):
-        super().__init__()
-        self.window_size = window_size
-        self.num_relative_distance = (2 * window_size[0] - 1) * (2 * window_size[1] - 1) + 3
-        self.relative_position_bias_table = nn.Parameter(
-            torch.zeros(self.num_relative_distance, num_heads))  # 2*Wh-1 * 2*Ww-1, nH
-        # cls to token & token 2 cls & cls to cls
-
-        # get pair-wise relative position index for each token inside the window
-        coords_h = torch.arange(window_size[0])
-        coords_w = torch.arange(window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
-        coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
-        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
-        relative_coords[:, :, 0] += window_size[0] - 1  # shift to start from 0
-        relative_coords[:, :, 1] += window_size[1] - 1
-        relative_coords[:, :, 0] *= 2 * window_size[1] - 1
-        relative_position_index = \
-            torch.zeros(size=(window_size[0] * window_size[1] + 1,) * 2, dtype=relative_coords.dtype)
-        relative_position_index[1:, 1:] = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
-        relative_position_index[0, 0:] = self.num_relative_distance - 3
-        relative_position_index[0:, 0] = self.num_relative_distance - 2
-        relative_position_index[0, 0] = self.num_relative_distance - 1
-
-        self.register_buffer("relative_position_index", relative_position_index)
-
-    def forward(self):
-        relative_position_bias = \
-            self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-                self.window_size[0] * self.window_size[1] + 1,
-                self.window_size[0] * self.window_size[1] + 1, -1)  # Wh*Ww,Wh*Ww,nH
-        return relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
-
-
-class VisionTransformer(nn.Module):
-    """ Vision Transformer with support for patch or hybrid CNN input stage
+    grid_size: int of the grid height and width
+    return:
+    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
     """
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
-                 num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., norm_layer=nn.LayerNorm, init_values=None,
-                 use_abs_pos_emb=True, use_rel_pos_bias=False, use_shared_rel_pos_bias=False,
-                 use_mean_pooling=True, init_scale=0.001):
-        super().__init__()
-        self.num_classes = num_classes
-        self.num_features = self.embed_dim = embed_dim
-        self.patch_size = patch_size
-        self.in_chans = in_chans
+    grid_h = np.arange(grid_size_h, dtype=np.float32)
+    grid_w = np.arange(grid_size_w, dtype=np.float32)
+    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
+    grid = np.stack(grid, axis=0)
 
-        self.patch_embed = PatchEmbed(
-            img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+    grid = grid.reshape([2, 1, grid_size_h, grid_size_w])
+    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
+    if cls_token:
+        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
+    return pos_embed
+
+
+def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
+    assert embed_dim % 2 == 0
+
+    # use half of dimensions to encode grid_h
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
+
+    emb = np.concatenate([emb_h, emb_w], axis=1) # (H*W, D)
+    return emb
+
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    """
+    embed_dim: output dimension for each position
+    pos: a list of positions to be encoded: size (M,)
+    out: (M, D)
+    """
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=float)
+    # omega = np.arange(embed_dim // 2, dtype=np.float)
+    omega /= embed_dim / 2.
+    omega = 1. / 10000**omega  # (D/2,)
+
+    pos = pos.reshape(-1)  # (M,)
+    out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
+
+    emb_sin = np.sin(out) # (M, D/2)
+    emb_cos = np.cos(out) # (M, D/2)
+
+    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
+    return emb
+
+
+# --------------------------------------------------------
+# Interpolate position embeddings for high-resolution
+# References:
+# DeiT: https://github.com/facebookresearch/deit
+# --------------------------------------------------------
+def interpolate_pos_embed(model, checkpoint_model):
+    if 'pos_embed' in checkpoint_model:
+        pos_embed_checkpoint = checkpoint_model['pos_embed']
+        embedding_size = pos_embed_checkpoint.shape[-1]
+        num_patches = model.patch_embed.num_patches
+        num_extra_tokens = model.pos_embed.shape[-2] - num_patches
+        # height (== width) for the checkpoint position embedding
+        orig_size = int((pos_embed_checkpoint.shape[-2] - num_extra_tokens) ** 0.5)
+        # height (== width) for the new position embedding
+        new_size = int(num_patches ** 0.5)
+        # class_token and dist_token are kept unchanged
+        if orig_size != new_size:
+            print("Position interpolate from %dx%d to %dx%d" % (orig_size, orig_size, new_size, new_size))
+            extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
+            # only the position tokens are interpolated
+            pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
+            pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
+            pos_tokens = torch.nn.functional.interpolate(
+                pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
+            pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
+            new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
+            checkpoint_model['pos_embed'] = new_pos_embed
+
+
+
+class vessel_MIM(nn.Module):
+    def __init__(self, img_size=(48,512), patch_size=(16,32), mask_ratio=0.75, in_chans=1,
+                 embed_dim=512, depth=4, num_heads=8,
+                 decoder_embed_dim=256, decoder_depth=2, decoder_num_heads=8,
+                 mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False):
+        super().__init__()
+
+        # --------------------------------------------------------------------------
+        # MAE encoder specifics
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
         num_patches = self.patch_embed.num_patches
+        self.mask_ratio = mask_ratio
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        if use_abs_pos_emb:
-            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
-        else:
-            self.pos_embed = None
-        self.pos_drop = nn.Dropout(p=drop_rate)
-
-        if use_shared_rel_pos_bias:
-            self.rel_pos_bias = RelativePositionBias(window_size=self.patch_embed.patch_shape, num_heads=num_heads)
-        else:
-            self.rel_pos_bias = None
-
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
-        self.use_rel_pos_bias = use_rel_pos_bias
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim), requires_grad=False)  # fixed sin-cos embedding
+    
         self.blocks = nn.ModuleList([
-            Block(
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
-                init_values=init_values, window_size=self.patch_embed.patch_shape if use_rel_pos_bias else None)
+            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
             for i in range(depth)])
-        self.norm = nn.Identity() if use_mean_pooling else norm_layer(embed_dim)
-        self.fc_norm = norm_layer(embed_dim) if use_mean_pooling else None
-        self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+        self.norm = norm_layer(embed_dim)
 
-        if self.pos_embed is not None:
-            self._trunc_normal_(self.pos_embed, std=.02)
-        self._trunc_normal_(self.cls_token, std=.02)
-        if num_classes > 0:
-            self._trunc_normal_(self.head.weight, std=.02)
+        #fom_lossのためのlinear層、層数は検討の余地あり
+        self.fom_mlp = nn.Sequential(
+            nn.Linear(embed_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+
+        # --------------------------------------------------------------------------
+        # MAE decoder specifics
+        self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
+
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
+        self.decoder_cls_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
+
+        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, decoder_embed_dim), requires_grad=False)  # fixed sin-cos embedding
+
+        self.decoder_blocks = nn.ModuleList([
+            Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
+            for i in range(decoder_depth)])
+
+        self.decoder_norm = norm_layer(decoder_embed_dim)
+        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size[0]*patch_size[1] * in_chans, bias=True) # decoder to patch
+        # self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * in_chans, bias=True) # decoder to patch
+        # --------------------------------------------------------------------------        
+        self.norm_pix_loss = norm_pix_loss
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        # initialization
+        # initialize (and freeze) pos_embed by sin-cos embedding
+        imgh = self.patch_embed.img_size[0]
+        imgw = self.patch_embed.img_size[1]
+        ph = self.patch_embed.patch_size[0]
+        pw = self.patch_embed.patch_size[1]
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], imgh//ph, imgw//pw, cls_token=True)
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        decoder_pos_embed = get_2d_sincos_pos_embed(self.decoder_pos_embed.shape[-1],imgh//ph,imgw//pw, cls_token=True)
+        self.decoder_pos_embed.data.copy_(torch.from_numpy(decoder_pos_embed).float().unsqueeze(0))
+
+        # initialize patch_embed like nn.Linear (instead of nn.Conv2d)
+        w = self.patch_embed.proj.weight.data
+        torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+
+        # timm's trunc_normal_(std=.02) is effectively normal_(std=0.02) as cutoff is too big (2.)
+        torch.nn.init.normal_(self.cls_token, std=.02)
+        # torch.nn.init.normal_(self.mask_token, std=.02)
+
+        # initialize nn.Linear and nn.LayerNorm
         self.apply(self._init_weights)
-        self.fix_init_weight()
-
-        if num_classes > 0:
-            self.head.weight.data.mul_(init_scale)
-            self.head.bias.data.mul_(init_scale)
-
-    def _trunc_normal_(self, tensor, mean=0., std=1.):
-        trunc_normal_(tensor, mean=mean, std=std)
-
-    def fix_init_weight(self):
-        def rescale(param, layer_id):
-            param.div_(math.sqrt(2.0 * layer_id))
-
-        for layer_id, layer in enumerate(self.blocks):
-            rescale(layer.attn.proj.weight.data, layer_id + 1)
-            rescale(layer.mlp.fc2.weight.data, layer_id + 1)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            self._trunc_normal_(m.weight, std=.02)
+            # we use xavier_uniform following official JAX ViT:
+            torch.nn.init.xavier_uniform_(m.weight)
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-        elif isinstance(m, nn.Conv2d):
-            self._trunc_normal_(m.weight, std=.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
 
-    def get_num_layers(self):
-        return len(self.blocks)
+    def patchify(self, imgs):
+        """
+        imgs: (N, 3, H, W)
+        x: (N, L, patch_size**2 *3)
+        """
+        ph = self.patch_embed.patch_size[0]
+        pw = self.patch_embed.patch_size[1]
+        # assert imgs.shape[2] == imgs.shape[3] and imgs.shape[2] % p == 0
 
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        return {'pos_embed', 'cls_token'}
-
-    def get_classifier(self):
-        return self.head
-
-    def reset_classifier(self, num_classes, global_pool=''):
-        self.num_classes = num_classes
-        self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
-
-    def forward_features(self, x):
-        x = self.patch_embed(x)
-        batch_size, seq_len, _ = x.size()
-
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
-        x = torch.cat((cls_tokens, x), dim=1)
-        if self.pos_embed is not None:
-            x = x + self.pos_embed
-        x = self.pos_drop(x)
-
-        rel_pos_bias = self.rel_pos_bias() if self.rel_pos_bias is not None else None
-        for blk in self.blocks:
-            x = blk(x, rel_pos_bias=rel_pos_bias)
-
-        x = self.norm(x)
-        if self.fc_norm is not None:
-            t = x[:, 1:, :]
-            return self.fc_norm(t.mean(1))
-        else:
-            return x[:, 0]
-
-    def forward(self, x):
-        x = self.forward_features(x)
-        x = self.head(x)
+        h  = imgs.shape[2] // ph
+        w = imgs.shape[3] // pw
+        x = imgs.reshape(shape=(imgs.shape[0], imgs.shape[1], h, ph, w, pw))
+        x = torch.einsum('nchpwq->nhwpqc', x)
+        x = x.reshape(shape=(imgs.shape[0], h * w, ph*pw * imgs.shape[1]))
         return x
 
+    def unpatchify(self, x):
+        """
+        x: (N, L, patch_size**2 *3)
+        imgs: (N, 3, H, W)
+        """
+        ph = self.patch_embed.patch_size[0]
+        pw = self.patch_embed.patch_size[1]
+        imgh = self.patch_embed.img_size[0]
+        imgw = self.patch_embed.img_size[1]
 
-class VisionTransformerForSimMIM(VisionTransformer):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+        #ここの数は注意が必要
+        h = imgh/ph
+        w = imgw/pw
+        # assert h * w == x.shape[1]
+        
+        x = x.reshape(shape=(x.shape[0], h, w, ph, pw, 1))
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        imgs = x.reshape(shape=(x.shape[0], 1, h * ph, h * pw))
+        return imgs
 
-        assert self.num_classes == 0
+    def random_masking(self, x, mask_ratio):
+        """
+        Perform per-sample random masking by per-sample shuffling.
+        Per-sample shuffling is done by argsort random noise.
+        x: [N, L, D], sequence
+        """
+        N, L, D = x.shape  # batch, length, dim
+        len_keep = int(L * (1 - mask_ratio))
+        
+        noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
+        
+        # sort noise for each sample
+        ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
 
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
-        self._trunc_normal_(self.mask_token, std=.02)
+        # keep the first subset
+        ids_keep = ids_shuffle[:, :len_keep]
+        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
 
-    def _trunc_normal_(self, tensor, mean=0., std=1.):
-        trunc_normal_(tensor, mean=mean, std=std, a=-std, b=std)
+        # generate the binary mask: 0 is keep, 1 is remove
+        mask = torch.ones([N, L], device=x.device)
+        mask[:, :len_keep] = 0
+        # unshuffle to get the binary mask
+        mask = torch.gather(mask, dim=1, index=ids_restore)
 
-    def forward(self, x, mask):
+        return x_masked, mask, ids_restore
+
+    def forward_encoder(self, x):
+        # embed patches
         x = self.patch_embed(x)
 
-        assert mask is not None
-        B, L, _ = x.shape
+        # add pos embed w/o cls token
+        x = x + self.pos_embed[:, 1:, :]
 
-        mask_token = self.mask_token.expand(B, L, -1)
-        w = mask.flatten(1).unsqueeze(-1).type_as(mask_token)
-        x = x * (1 - w) + mask_token * w
+        # masking: length -> length * mask_ratio
+        # x, mask, ids_restore = self.random_masking(x, mask_ratio)
 
-        cls_tokens = self.cls_token.expand(B, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
+        # append cls token
+        cls_token = self.cls_token + self.pos_embed[:, :1, :]
+        cls_tokens = cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
+        # print(x.shape)
 
-        if self.pos_embed is not None:
-            x = x + self.pos_embed
-        x = self.pos_drop(x)
-
-        rel_pos_bias = self.rel_pos_bias() if self.rel_pos_bias is not None else None
+        # apply Transformer blocks
         for blk in self.blocks:
-            x = blk(x, rel_pos_bias=rel_pos_bias)
+            x = blk(x)
         x = self.norm(x)
 
-        x = x[:, 1:]
-        B, L, C = x.shape
-        H = W = int(L ** 0.5)
-        x = x.permute(0, 2, 1).reshape(B, C, H, W)
-        return x
-    
+        # remove cls token
+        x = x[:, 1:, :]
 
-class SimMIM(nn.Module):
-    def __init__(self, encoder, encoder_stride):
-        super().__init__()
-        self.encoder = encoder
-        self.encoder_stride = encoder_stride
+        #save cls token
+        feature = x[:, 0, :]
+        feature = feature.squeeze(1)
 
-        self.decoder = nn.Sequential(
-            nn.Conv2d(
-                in_channels=self.encoder.num_features,
-                out_channels=self.encoder_stride ** 2 * 3, kernel_size=1),
-            nn.PixelShuffle(self.encoder_stride),
-        )
+        return x, feature
 
-        self.in_chans = self.encoder.in_chans
-        self.patch_size = self.encoder.patch_size
+    def forward_decoder(self, x, mask_ratio):
+        # embed tokens
+        x = self.decoder_embed(x)
 
-    def forward(self, x, mask):
-        z = self.encoder(x, mask)
-        x_rec = self.decoder(z)
+        x, mask, ids_restore = self.random_masking(x, mask_ratio)
 
-        mask = mask.repeat_interleave(self.patch_size, 1).repeat_interleave(self.patch_size, 2).unsqueeze(1).contiguous()
-        loss_recon = F.l1_loss(x, x_rec, reduction='none')
-        loss = (loss_recon * mask).sum() / (mask.sum() + 1e-5) / self.in_chans
+        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
+
+        x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)  # no cls token
+        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
+        x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
+
+        # add pos embed
+        x = x + self.decoder_pos_embed
+
+        # apply Transformer blocks
+        for blk in self.decoder_blocks:
+            x = blk(x)
+        x = self.decoder_norm(x)
+
+        # predictor projection
+        x = self.decoder_pred(x)
+
+        # remove cls token
+        x = x[:, 1:, :]
+        # print(x.shape)
+
+        return x, mask, ids_restore
+
+    def forward_mae_loss(self, imgs, pred, mask):
+        """
+        imgs: [N, 3, H, W]
+        pred: [N, L, p*p*3]
+        mask: [N, L], 0 is keep, 1 is remove, 
+        """
+        target = self.patchify(imgs)
+        if self.norm_pix_loss:
+            mean = target.mean(dim=-1, keepdim=True)
+            var = target.var(dim=-1, keepdim=True)
+            target = (target - mean) / (var + 1.e-6)**.5
+     
+        loss = (pred - target) ** 2
+        loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
+        # tmp=loss * mask
+        loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
+
         return loss
+
+    def forward_fom_loss(self,feature,fom):
+        """
+        feature: [N, embed_dim]
+        fom: [N, 1]
+        """
+        pred = self.fom_mlp(feature)
+        loss = (pred - fom) ** 2
+        loss = loss.mean()
+
+        return loss
+
+    def forward(self, imgs, fom):
+        latent, feature = self.forward_encoder(imgs)
+        pred, mask, ids_restore = self.forward_decoder(latent, self.mask_ratio)  # [N, L, p*p*3]
+        mae_loss = self.forward_mae_loss(imgs, pred, mask)
+        fom_loss = self.forward_fom_loss(feature,fom)
+        return fom_loss, mae_loss
+
+
