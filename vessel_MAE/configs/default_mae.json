@@ -1,0 +1,17 @@
+{
+    "model_params": {
+        "lr": 0.0001,
+        "num_epochs":2000,
+        "batch_size":16,
+        "patch_size": [16,32],
+        "mask_ratio": 0.75,
+        "loss_ratio": 0.5
+    },
+    "data_params": {
+        "data_dir": "/root/work/data/2021",
+        "result_dir": "/root/work/result/test"
+    },
+  
+    "random_state": 1,
+    "random_seed" : 0
+}

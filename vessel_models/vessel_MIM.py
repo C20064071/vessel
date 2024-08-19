@@ -167,7 +167,7 @@ class vessel_MIM(nn.Module):
 
         # timm's trunc_normal_(std=.02) is effectively normal_(std=0.02) as cutoff is too big (2.)
         torch.nn.init.normal_(self.cls_token, std=.02)
-        # torch.nn.init.normal_(self.mask_token, std=.02)
+        torch.nn.init.normal_(self.mask_token, std=.02)
 
         # initialize nn.Linear and nn.LayerNorm
         self.apply(self._init_weights)
@@ -191,7 +191,7 @@ class vessel_MIM(nn.Module):
         pw = self.patch_embed.patch_size[1]
         # assert imgs.shape[2] == imgs.shape[3] and imgs.shape[2] % p == 0
 
-        h  = imgs.shape[2] // ph
+        h = imgs.shape[2] // ph
         w = imgs.shape[3] // pw
         x = imgs.reshape(shape=(imgs.shape[0], imgs.shape[1], h, ph, w, pw))
         x = torch.einsum('nchpwq->nhwpqc', x)
@@ -209,13 +209,15 @@ class vessel_MIM(nn.Module):
         imgw = self.patch_embed.img_size[1]
 
         #ここの数は注意が必要
-        h = imgh/ph
-        w = imgw/pw
+        h = imgh//ph
+        w = imgw//pw
         # assert h * w == x.shape[1]
         
         x = x.reshape(shape=(x.shape[0], h, w, ph, pw, 1))
         x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], 1, h * ph, h * pw))
+        imgs = x.reshape(shape=(x.shape[0], 1, h * ph, w * pw))
+        # imgs = x.reshape(shape=(x.shape[0], 1, h * ph, h * pw))
+        # こうなってたけど間違い？
         return imgs
 
     def random_masking(self, x, mask_ratio):

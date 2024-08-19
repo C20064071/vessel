@@ -98,7 +98,7 @@ def interpolate_pos_embed(model, checkpoint_model):
 
 
 
-class vessel_MIM(nn.Module):
+class vessel_SimMIM(nn.Module):
     def __init__(self, img_size=(48,512), patch_size=(16,32), mask_ratio=0.75, in_chans=1,
                  embed_dim=512, depth=4, num_heads=8,
                  decoder_embed_dim=256, decoder_depth=2, decoder_num_heads=8,
@@ -140,6 +140,15 @@ class vessel_MIM(nn.Module):
         self.decoder_blocks = nn.ModuleList([
             Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
             for i in range(decoder_depth)])
+        
+        self.decoder_conv1d = nn.Conv1d(in_channels=decoder_embed_dim, out_channels=decoder_embed_dim, kernel_size=1)
+
+        self.decoder_linear = nn.Sequential(
+            nn.Linear(decoder_embed_dim, decoder_embed_dim*2),
+            nn.ReLU(),
+            nn.Linear(decoder_embed_dim*2, decoder_embed_dim)
+        )
+
 
         self.decoder_norm = norm_layer(decoder_embed_dim)
         self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size[0]*patch_size[1] * in_chans, bias=True) # decoder to patch
@@ -209,8 +218,8 @@ class vessel_MIM(nn.Module):
         imgw = self.patch_embed.img_size[1]
 
         #ここの数は注意が必要
-        h = imgh/ph
-        w = imgw/pw
+        h = imgh//ph
+        w = imgw//pw
         # assert h * w == x.shape[1]
         
         x = x.reshape(shape=(x.shape[0], h, w, ph, pw, 1))
@@ -259,12 +268,12 @@ class vessel_MIM(nn.Module):
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
-        # print(x.shape)
 
         # apply Transformer blocks
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
+
 
         # remove cls token
         x = x[:, 1:, :]
@@ -290,10 +299,20 @@ class vessel_MIM(nn.Module):
         # add pos embed
         x = x + self.decoder_pos_embed
 
-        # apply Transformer blocks
-        for blk in self.decoder_blocks:
-            x = blk(x)
-        x = self.decoder_norm(x)
+
+        # # apply Transformer blocks
+        # for blk in self.decoder_blocks:
+        #     x = blk(x)
+        # x = self.decoder_norm(x)
+
+        # #1D conv
+        # x = x.permute(0, 2, 1) 
+        # x = self.decoder_conv1d(x)
+        # x = x.permute(0, 2, 1) 
+
+        # linear
+        x = self.decoder_linear(x)
+
 
         # predictor projection
         x = self.decoder_pred(x)
